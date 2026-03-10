@@ -51,9 +51,18 @@ CATEGORY_RULES = {
 #  Use named groups: (?P<amount>...) (?P<merchant>...) (?P<date>...)
 # ──────────────────────────────────────────────────────────────
 BANK_PATTERNS = [
+    # ── Trust Bank Singapore ──────────────────────────────────
+    # Matches: "You've spent DKK 175.95 using Trust Link card at Wolt Denmark DK on 10 Mar 2026 21:35SGT"
+    {
+        "name": "Trust Bank SG",
+        "amount":   r"You(?:'|&#39;|&rsquo;|‘|’|ve) ?(?:ve )?spent\s+(?P<currency>[A-Z]{3})\s+(?P<amount>[\d,]+\.?\d*)",
+        "merchant": r"card at\s+(?P<merchant>.+?)\s+on\s+\d{1,2}\s+\w+\s+\d{4}",
+        "date":     r"on\s+(?P<date>\d{1,2}\s+\w+\s+\d{4})",
+    },
     # ── Chase Bank ────────────────────────────────────────────
     {
         "name": "Chase",
+        "currency_default": "USD",
         "amount": r"(?:Amount|charged|purchase of)[:\s]*\$(?P<amount>[\d,]+\.?\d*)",
         "merchant": r"(?:at|merchant|from)[:\s]+(?P<merchant>[A-Za-z0-9 &',\.\-]+?)(?:\s*on|\s*for|\n|\r|\.)",
         "date": r"(?:on|date)[:\s]+(?P<date>\w+ \d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
@@ -61,6 +70,7 @@ BANK_PATTERNS = [
     # ── Bank of America ───────────────────────────────────────
     {
         "name": "Bank of America",
+        "currency_default": "USD",
         "amount": r"\$(?P<amount>[\d,]+\.\d{2})\s*(?:was charged|charge|transaction)",
         "merchant": r"(?:at|Merchant)[:\s]+(?P<merchant>[A-Za-z0-9 &',\.\-]+?)(?:\n|\r|\.|on\s)",
         "date": r"(?:on|Date)[:\s]*(?P<date>\d{2}/\d{2}/\d{4}|\w+ \d{1,2},?\s*\d{4})",
@@ -68,6 +78,7 @@ BANK_PATTERNS = [
     # ── Wells Fargo ───────────────────────────────────────────
     {
         "name": "Wells Fargo",
+        "currency_default": "USD",
         "amount": r"(?:debit|charge|purchase)[^$]*\$(?P<amount>[\d,]+\.?\d*)",
         "merchant": r"(?:at|to)[:\s]+(?P<merchant>[A-Za-z0-9 &',\.\-]+?)(?:\s*\.|\s*on|\n)",
         "date": r"(?P<date>\d{2}/\d{2}/\d{4})",
@@ -75,6 +86,7 @@ BANK_PATTERNS = [
     # ── Citi ──────────────────────────────────────────────────
     {
         "name": "Citi",
+        "currency_default": "USD",
         "amount": r"(?:Amount|USD)[:\s]*\$?(?P<amount>[\d,]+\.\d{2})",
         "merchant": r"(?:Merchant|Description)[:\s]+(?P<merchant>[A-Za-z0-9 &',\.\-\*]+?)(?:\n|\r|\s{2,})",
         "date": r"(?:Date)[:\s]+(?P<date>\d{2}/\d{2}/\d{4}|\w+\.?\s+\d{1,2},?\s+\d{4})",
@@ -82,6 +94,7 @@ BANK_PATTERNS = [
     # ── Generic fallback ──────────────────────────────────────
     {
         "name": "Generic",
+        "currency_default": "USD",
         "amount": r"\$(?P<amount>[\d,]+\.\d{2})",
         "merchant": r"(?:at|from|merchant)[:\s]+(?P<merchant>[A-Za-z0-9 &',\.\-]+?)(?:\s*[\.\n\r])",
         "date": r"(?P<date>\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\w+ \d{1,2},?\s*\d{4})",
@@ -115,6 +128,7 @@ def parse_date(raw: str) -> Optional[str]:
         "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y",
         "%B %d %Y", "%B %d, %Y", "%b %d %Y", "%b %d, %Y",
         "%b. %d, %Y", "%b. %d %Y",
+        "%d %b %Y", "%d %B %Y",   # Trust Bank: "10 Mar 2026"
     ]
     for fmt in formats:
         try:
@@ -163,6 +177,12 @@ def parse_transaction_from_text(text: str) -> Optional[dict]:
             if not amount or amount <= 0:
                 continue
 
+            # Extract currency: from named group or pattern default
+            try:
+                currency = amount_match.group("currency")
+            except IndexError:
+                currency = pattern.get("currency_default", "USD")
+
             merchant = (merchant_match.group("merchant").strip()
                         if merchant_match else "Unknown Merchant")
             date_str = parse_date(date_match.group("date") if date_match else None)
@@ -170,6 +190,7 @@ def parse_transaction_from_text(text: str) -> Optional[dict]:
 
             return {
                 "amount":      amount,
+                "currency":    currency,
                 "merchant":    merchant,
                 "category":    category,
                 "date":        date_str,
@@ -193,23 +214,23 @@ class EmailClient:
         self.sender_filter = sender_filter
 
     def fetch_new_transactions(self, processed_uids: set) -> list[dict]:
-        """Connect via IMAP and return list of parsed transaction dicts."""
+        """Connect via IMAP, fetch all emails from bank sender, return parsed transactions."""
         results = []
         try:
             mail = imaplib.IMAP4_SSL(self.host, self.port)
             mail.login(self.user, self.password)
             mail.select("INBOX")
 
-            # Search for emails from the bank sender
+            # Search ALL emails from the bank sender (duplicates blocked by DB unique constraint)
             _, data = mail.search(None, f'FROM "{self.sender_filter}"')
             uids = data[0].split()
 
-            logger.info(f"📧 Found {len(uids)} emails from {self.sender_filter}")
+            logger.info(f"Found {len(uids)} emails from {self.sender_filter}")
 
             for uid in uids:
                 uid_str = uid.decode()
                 if uid_str in processed_uids:
-                    continue  # already handled
+                    continue  # already handled this session
 
                 _, msg_data = mail.fetch(uid, "(RFC822)")
                 raw = msg_data[0][1]
@@ -220,9 +241,9 @@ class EmailClient:
                 if parsed:
                     parsed["email_uid"] = uid_str
                     results.append(parsed)
-                    logger.info(f"✅ Parsed: {parsed['merchant']} ${parsed['amount']}")
+                    logger.info(f"Parsed: {parsed['merchant']} {parsed.get('currency', '$')}{parsed['amount']}")
                 else:
-                    logger.warning(f"⚠️  Could not parse email UID {uid_str}")
+                    logger.debug(f"Could not parse email UID {uid_str}")
 
             mail.logout()
         except imaplib.IMAP4.error as e:

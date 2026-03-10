@@ -28,6 +28,7 @@ def init_db():
                 amount      REAL NOT NULL,
                 merchant    TEXT,
                 category    TEXT DEFAULT 'Uncategorized',
+                currency    TEXT DEFAULT '$',
                 description TEXT,
                 email_uid   TEXT UNIQUE,           -- prevents duplicate imports
                 created_at  TEXT DEFAULT (datetime('now'))
@@ -51,6 +52,12 @@ def init_db():
             VALUES ('monthly_budget', '3000'), ('currency', '$')
         """)
         conn.commit()
+    # Migrate: add currency column if missing (for existing databases)
+    with get_conn() as conn:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()]
+        if "currency" not in cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN currency TEXT DEFAULT '$'")
+            conn.commit()
     print("✅ Database initialised.")
 
 
@@ -58,14 +65,15 @@ def init_db():
 
 def add_transaction(date_str: str, amount: float, merchant: str,
                     category: str, description: str,
-                    email_uid: Optional[str] = None) -> Optional[int]:
+                    email_uid: Optional[str] = None,
+                    currency: str = "$") -> Optional[int]:
     """Insert a transaction. Returns new row id, or None if duplicate."""
     try:
         with get_conn() as conn:
             cur = conn.execute("""
-                INSERT INTO transactions (date, amount, merchant, category, description, email_uid)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (date_str, amount, merchant, category, description, email_uid))
+                INSERT INTO transactions (date, amount, merchant, category, currency, description, email_uid)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (date_str, amount, merchant, category, currency, description, email_uid))
             conn.commit()
             return cur.lastrowid
     except sqlite3.IntegrityError:
@@ -76,7 +84,7 @@ def get_today_transactions() -> list:
     today = date.today().isoformat()
     with get_conn() as conn:
         return conn.execute("""
-            SELECT * FROM transactions WHERE date = ? ORDER BY created_at DESC
+            SELECT * FROM transactions WHERE date = ? ORDER BY currency ASC, created_at DESC
         """, (today,)).fetchall()
 
 
@@ -89,7 +97,7 @@ def get_month_transactions(year: int = None, month: int = None) -> list:
         return conn.execute("""
             SELECT * FROM transactions
             WHERE date LIKE ?
-            ORDER BY date DESC, created_at DESC
+            ORDER BY currency ASC, date DESC, created_at DESC
         """, (f"{prefix}%",)).fetchall()
 
 
@@ -105,6 +113,22 @@ def get_category_totals(year: int = None, month: int = None) -> list:
             WHERE date LIKE ?
             GROUP BY category
             ORDER BY total DESC
+        """, (f"{prefix}%",)).fetchall()
+
+
+def get_category_totals_by_currency(year: int = None, month: int = None) -> list:
+    """Return category totals grouped by currency, then category."""
+    now = datetime.now()
+    y = year or now.year
+    m = month or now.month
+    prefix = f"{y}-{m:02d}"
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT currency, category, SUM(amount) as total, COUNT(*) as count
+            FROM transactions
+            WHERE date LIKE ?
+            GROUP BY currency, category
+            ORDER BY currency ASC, total DESC
         """, (f"{prefix}%",)).fetchall()
 
 
@@ -131,6 +155,32 @@ def get_daily_totals_this_month() -> list:
             GROUP BY date
             ORDER BY date ASC
         """, (f"{prefix}%",)).fetchall()
+
+
+def get_daily_totals_by_currency() -> list:
+    """Return daily totals grouped by currency for this month."""
+    now = datetime.now()
+    prefix = f"{now.year}-{now.month:02d}"
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT date, currency, SUM(amount) as total
+            FROM transactions
+            WHERE date LIKE ?
+            GROUP BY date, currency
+            ORDER BY date ASC, currency ASC
+        """, (f"{prefix}%",)).fetchall()
+
+
+def get_monthly_trend_by_currency(months: int = 6) -> list:
+    """Return monthly totals grouped by currency."""
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT substr(date, 1, 7) as month, currency, SUM(amount) as total
+            FROM transactions
+            GROUP BY month, currency
+            ORDER BY month DESC, currency ASC
+            LIMIT ?
+        """, (months * 10,)).fetchall()
 
 
 # ── Budgets ───────────────────────────────────────────────────
