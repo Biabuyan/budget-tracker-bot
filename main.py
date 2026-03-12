@@ -1,30 +1,35 @@
 """
-main.py — Entry point: runs the Telegram bot + email polling scheduler
+main.py — Entry point: Telegram bot + FastAPI web server + Gmail polling scheduler
+
+Runs three things concurrently:
+  1. Telegram bot (long-polling via python-telegram-bot)
+  2. FastAPI web server (uvicorn, for OAuth callbacks & health checks)
+  3. APScheduler job that polls Gmail API for every connected user
 """
 
 import os
 import sys
 import asyncio
 import logging
-from datetime import datetime
-from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
 load_dotenv()
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 import src.database as db
-from src.email_parser import EmailClient
 from src.bot import build_app, notify_transaction
-
-os.makedirs("logs", exist_ok=True)
-os.makedirs("data", exist_ok=True)
+from src.gmail_client import refresh_access_token, fetch_transactions_for_user
+from src.email_parser import parse_transaction_from_text
+from src.encryption import encrypt
 
 # ── Fix Windows console Unicode (emoji) encoding ──────────────
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,88 +43,144 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
-#  EMAIL CHECK JOB (runs every N minutes via scheduler)
+#  GMAIL CHECK JOB  (multi-user, runs every N minutes)
 # ─────────────────────────────────────────────────────────────
 
-_processed_uids: set = set()
+async def check_gmail_all_users(telegram_app):
+    """For every user with a Gmail connection, refresh token → fetch → parse → save → notify."""
+    connections = db.get_all_gmail_connections()
+    if not connections:
+        logger.info("No Gmail connections to check.")
+        return
 
+    logger.info(f"Checking Gmail for {len(connections)} user(s)...")
 
-async def check_emails(app, client: EmailClient):
-    """Poll inbox, parse new transactions, push Telegram notifications."""
-    logger.info("Processing emails...")
+    for conn in connections:
+        user_id = conn["user_id"]
+        try:
+            # Refresh access token if expired (or nearly expired)
+            token_expiry = conn.get("token_expiry")
+            access_token_enc = conn["access_token_encrypted"]
 
-    new_txs = client.fetch_new_transactions(_processed_uids)
+            needs_refresh = True
+            if token_expiry and token_expiry > datetime.now(timezone.utc) + timedelta(minutes=2):
+                needs_refresh = False
 
-    for tx in new_txs:
-        uid = tx.get("email_uid")
-        row_id = db.add_transaction(
-            date_str    = tx["date"],
-            amount      = tx["amount"],
-            merchant    = tx["merchant"],
-            category    = tx["category"],
-            description = tx.get("description", ""),
-            email_uid   = uid,
-            currency    = tx.get("currency", "$"),
-        )
-        if row_id:
-            _processed_uids.add(uid)
-            logger.info(f"Saved tx #{row_id}: {tx['merchant']} {tx.get('currency', '$')}{tx['amount']}")
-            try:
-                await notify_transaction(app, tx)
-            except Exception as e:
-                logger.error(f"Failed to notify for tx #{row_id}: {e}")
-        else:
-            logger.info(f"Skipped duplicate: {uid}")
+            if needs_refresh:
+                result = await refresh_access_token(conn["refresh_token_encrypted"])
+                access_token = result["access_token"]
+                new_expiry = datetime.now(timezone.utc) + timedelta(seconds=result["expires_in"])
+                access_token_enc = encrypt(access_token)
+                db.update_gmail_tokens(user_id, access_token_enc, new_expiry)
+                logger.info(f"Refreshed token for user {user_id}")
+            else:
+                from src.encryption import decrypt
+                access_token = decrypt(access_token_enc)
 
-    logger.info("Processing emails done")
+            # Fetch new messages
+            transactions = await fetch_transactions_for_user(access_token)
+
+            for tx in transactions:
+                row_id = db.add_transaction(
+                    user_id=user_id,
+                    date_str=tx["date"],
+                    amount=tx["amount"],
+                    merchant=tx["merchant"],
+                    category=tx["category"],
+                    description=tx.get("description", ""),
+                    source_message_id=tx.get("source_message_id"),
+                    currency=tx.get("currency", "$"),
+                )
+                if row_id:
+                    logger.info(f"User {user_id}: saved tx #{row_id}: {tx['merchant']} {tx.get('currency', '$')}{tx['amount']}")
+                    # Send Telegram notification
+                    tg_user_id = db.get_telegram_user_id_for(user_id)
+                    if tg_user_id:
+                        try:
+                            await notify_transaction(telegram_app, tg_user_id, tx)
+                        except Exception as e:
+                            logger.error(f"Failed to notify user {user_id}: {e}")
+                else:
+                    logger.debug(f"User {user_id}: skipped duplicate {tx.get('source_message_id')}")
+
+        except Exception as e:
+            logger.error(f"Gmail check failed for user {user_id}: {e}")
+
+    logger.info("Gmail check done.")
 
 
 # ─────────────────────────────────────────────────────────────
 #  STARTUP
 # ─────────────────────────────────────────────────────────────
 
+async def run_bot(telegram_app):
+    """Initialise and run the Telegram bot with long-polling."""
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Telegram bot is running.")
+
+
+async def run_web_server():
+    """Run the FastAPI/uvicorn web server."""
+    import uvicorn
+    from src.web import app as fastapi_app
+
+    port = int(os.getenv("PORT", "8080"))
+    config = uvicorn.Config(
+        fastapi_app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+    logger.info(f"FastAPI server starting on port {port}")
+    await server.serve()
+
+
+async def run_scheduler(telegram_app):
+    """Run periodic Gmail check using APScheduler."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    interval_min = int(os.getenv("EMAIL_CHECK_INTERVAL", "5"))
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        check_gmail_all_users,
+        "interval",
+        minutes=interval_min,
+        args=[telegram_app],
+        id="gmail_check",
+        max_instances=1,
+        next_run_time=datetime.now() + timedelta(seconds=10),  # first run 10s after start
+    )
+    scheduler.start()
+    logger.info(f"Gmail check scheduled every {interval_min} min")
+
+    try:
+        await asyncio.Event().wait()  # keep running forever
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+
+
 async def main():
     db.init_db()
 
-    app = build_app()
-    await app.initialize()
-    await app.start()
+    telegram_app = build_app()
 
-    email_client = EmailClient(
-        host          = os.getenv("IMAP_SERVER",       "imap.gmail.com"),
-        port          = int(os.getenv("IMAP_PORT",     "993")),
-        user          = os.getenv("EMAIL_ADDRESS",     ""),
-        password      = os.getenv("EMAIL_PASSWORD",    ""),
-        sender_filter = os.getenv("BANK_EMAIL_SENDER", ""),
-    )
-
-    interval_min = int(os.getenv("EMAIL_CHECK_INTERVAL", "5"))
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        check_emails,
-        "interval",
-        minutes       = interval_min,
-        args          = [app, email_client],
-        id            = "email_check",
-        max_instances = 1,
-        next_run_time = datetime.now(),   # ← run immediately on startup
-    )
-    scheduler.start()
-    logger.info(f"Email check scheduled every {interval_min} min")
-
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    await app.updater.start_polling(drop_pending_updates=True)
+    # Run bot polling, web server, and scheduler concurrently
+    await run_bot(telegram_app)
 
     try:
-        await asyncio.Event().wait()
+        await asyncio.gather(
+            run_web_server(),
+            run_scheduler(telegram_app),
+        )
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        scheduler.shutdown()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
         logger.info("Bot stopped cleanly.")
 
 
