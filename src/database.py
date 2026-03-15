@@ -13,7 +13,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import (
     create_engine, text, Column, BigInteger, Text, Numeric, Date,
-    DateTime, func, UniqueConstraint,
+    DateTime, ForeignKey, func, UniqueConstraint,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -42,25 +42,26 @@ class User(Base):
 
 class UserSetting(Base):
     __tablename__ = "user_settings"
-    user_id = Column(BigInteger, primary_key=True)
-    monthly_budget = Column(Numeric)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    monthly_budget = Column(Numeric, default=3000)
     base_currency = Column(Text, default="$")
     timezone = Column(Text, default="UTC")
 
 
 class GmailConnection(Base):
     __tablename__ = "gmail_connections"
-    user_id = Column(BigInteger, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     google_email = Column(Text)
     refresh_token_encrypted = Column(Text)
     access_token_encrypted = Column(Text)
     token_expiry = Column(DateTime(timezone=True))
+    last_gmail_check = Column(DateTime(timezone=True), nullable=True)
 
 
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     source_message_id = Column(Text)
     merchant = Column(Text)
     amount = Column(Numeric)
@@ -77,7 +78,7 @@ class Transaction(Base):
 class Budget(Base):
     __tablename__ = "budgets"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     category = Column(Text, nullable=False)
     monthly_limit = Column(Numeric, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -226,9 +227,18 @@ def get_all_gmail_connections() -> list[dict]:
                 "refresh_token_encrypted": r.refresh_token_encrypted,
                 "access_token_encrypted": r.access_token_encrypted,
                 "token_expiry": r.token_expiry,
+                "last_gmail_check": r.last_gmail_check,
             }
             for r in rows
         ]
+
+
+def update_last_gmail_check(user_id: int, checked_at: datetime):
+    """Record the timestamp of the most recent successful Gmail poll for a user."""
+    with get_session() as s:
+        row = s.query(GmailConnection).filter_by(user_id=user_id).first()
+        if row:
+            row.last_gmail_check = checked_at
 
 
 def update_gmail_tokens(user_id: int, access_token_enc: str, token_expiry: datetime):
@@ -252,11 +262,24 @@ def add_transaction(user_id: int, date_str: str, amount: float,
                     source_message_id: Optional[str] = None,
                     currency: str = "$") -> Optional[int]:
     """Insert a transaction. Returns new row id, or None if duplicate."""
+    # Parse date string to a proper date object
+    tx_date = None
+    if date_str:
+        if isinstance(date_str, date):
+            tx_date = date_str
+        else:
+            try:
+                tx_date = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                tx_date = date.today()
+    else:
+        tx_date = date.today()
+
     try:
         with get_session() as s:
             tx = Transaction(
                 user_id=user_id,
-                transaction_date=date_str,
+                transaction_date=tx_date,
                 amount=amount,
                 merchant=merchant,
                 category=category,
@@ -269,7 +292,9 @@ def add_transaction(user_id: int, date_str: str, amount: float,
             return tx.id
     except Exception as e:
         if "uq_user_source_msg" in str(e) or "duplicate" in str(e).lower():
-            return None  # duplicate
+            logger.debug(f"Duplicate transaction skipped: user={user_id} msg={source_message_id}")
+            return None
+        logger.error(f"Failed to add transaction: {e}")
         raise
 
 

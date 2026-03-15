@@ -21,8 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import src.database as db
 from src.bot import build_app, notify_transaction
 from src.gmail_client import refresh_access_token, fetch_transactions_for_user
-from src.email_parser import parse_transaction_from_text
-from src.encryption import encrypt
+from src.encryption import encrypt, decrypt
 
 # ── Fix Windows console Unicode (emoji) encoding ──────────────
 if sys.platform == "win32":
@@ -74,11 +73,12 @@ async def check_gmail_all_users(telegram_app):
                 db.update_gmail_tokens(user_id, access_token_enc, new_expiry)
                 logger.info(f"Refreshed token for user {user_id}")
             else:
-                from src.encryption import decrypt
                 access_token = decrypt(access_token_enc)
 
-            # Fetch new messages
-            transactions = await fetch_transactions_for_user(access_token)
+            # Fetch new messages (look back 2x the poll interval to avoid gaps)
+            interval_min = int(os.getenv("EMAIL_CHECK_INTERVAL", "5"))
+            days_back = max(1, round((interval_min * 2) / 1440) + 1)
+            transactions = await fetch_transactions_for_user(access_token, days_back=days_back)
 
             for tx in transactions:
                 row_id = db.add_transaction(
@@ -102,6 +102,9 @@ async def check_gmail_all_users(telegram_app):
                             logger.error(f"Failed to notify user {user_id}: {e}")
                 else:
                     logger.debug(f"User {user_id}: skipped duplicate {tx.get('source_message_id')}")
+
+            # Stamp the last successful check time for this user
+            db.update_last_gmail_check(user_id, datetime.now(timezone.utc))
 
         except Exception as e:
             logger.error(f"Gmail check failed for user {user_id}: {e}")

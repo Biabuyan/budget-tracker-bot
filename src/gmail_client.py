@@ -6,21 +6,19 @@ via the Gmail API (googleapis.com/auth/gmail.readonly).
 """
 
 import os
-import re
 import base64
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import httpx
 
-from src.encryption import encrypt, decrypt
+from src.encryption import decrypt
 from src.email_parser import parse_transaction_from_text
 
 logger = logging.getLogger(__name__)
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+BANK_EMAIL_SENDER = os.environ.get("BANK_EMAIL_SENDER", "")
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 
@@ -51,7 +49,7 @@ async def refresh_access_token(refresh_token_enc: str) -> dict:
 # ── Fetch messages ────────────────────────────────────────────
 
 async def fetch_new_messages(access_token: str,
-                             query: str = "is:unread",
+                             query: str = "newer_than:2d",
                              max_results: int = 20) -> list[dict]:
     """
     Fetch messages matching a Gmail search query.
@@ -136,15 +134,20 @@ def _extract_body(msg_data: dict) -> str:
 async def fetch_transactions_for_user(
     access_token: str,
     bank_sender: str = "",
+    days_back: int = 2,
 ) -> list[dict]:
     """
     Fetch recent bank emails and parse transactions.
     Returns list of parsed transaction dicts with 'source_message_id'.
+
+    Uses newer_than:Nd so already-processed messages are still detected
+    (deduplication is handled by source_message_id uniqueness in the DB).
+    BANK_EMAIL_SENDER env var is used if no explicit bank_sender is passed.
     """
-    # Build Gmail search query
-    query_parts = ["is:unread"]
-    if bank_sender:
-        query_parts.append(f"from:{bank_sender}")
+    sender = bank_sender or BANK_EMAIL_SENDER
+    query_parts = [f"newer_than:{days_back}d"]
+    if sender:
+        query_parts.append(f"from:{sender}")
     query = " ".join(query_parts)
 
     messages = await fetch_new_messages(access_token, query=query)

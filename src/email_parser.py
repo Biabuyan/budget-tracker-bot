@@ -1,17 +1,13 @@
 """
-email_parser.py — IMAP email reader + bank transaction parser
+email_parser.py — Bank transaction parser for email bodies
 
 Supports pattern-based parsing for common bank email formats.
 Add your bank's pattern in BANK_PATTERNS below.
 """
 
-import imaplib
-import email
 import re
-import os
 import logging
 from datetime import datetime
-from email.header import decode_header
 from typing import Optional
 from bs4 import BeautifulSoup
 
@@ -198,57 +194,3 @@ def parse_transaction_from_text(text: str) -> Optional[dict]:
                 "bank":        pattern["name"],
             }
     return None
-
-
-# # ──────────────────────────────────────────────────────────────
-# #  IMAP CLIENT
-# # ──────────────────────────────────────────────────────────────
-
-# class EmailClient:
-#     def __init__(self, host: str, port: int, user: str, password: str,
-#                  sender_filter: str):
-#         self.host   = host
-#         self.port   = port
-#         self.user   = user
-#         self.password = password
-#         self.sender_filter = sender_filter
-
-#     def fetch_new_transactions(self, processed_uids: set) -> list[dict]:
-#         """Connect via IMAP, fetch all emails from bank sender, return parsed transactions."""
-#         results = []
-#         try:
-#             mail = imaplib.IMAP4_SSL(self.host, self.port)
-#             mail.login(self.user, self.password)
-#             mail.select("INBOX")
-
-#             # Search ALL emails from the bank sender (duplicates blocked by DB unique constraint)
-#             _, data = mail.search(None, f'FROM "{self.sender_filter}"')
-#             uids = data[0].split()
-
-#             logger.info(f"Found {len(uids)} emails from {self.sender_filter}")
-
-#             for uid in uids:
-#                 uid_str = uid.decode()
-#                 if uid_str in processed_uids:
-#                     continue  # already handled this session
-
-#                 _, msg_data = mail.fetch(uid, "(RFC822)")
-#                 raw = msg_data[0][1]
-#                 msg = email.message_from_bytes(raw)
-#                 text = extract_text_from_email(msg)
-
-#                 parsed = parse_transaction_from_text(text)
-#                 if parsed:
-#                     parsed["email_uid"] = uid_str
-#                     results.append(parsed)
-#                     logger.info(f"Parsed: {parsed['merchant']} {parsed.get('currency', '$')}{parsed['amount']}")
-#                 else:
-#                     logger.debug(f"Could not parse email UID {uid_str}")
-
-#             mail.logout()
-#         except imaplib.IMAP4.error as e:
-#             logger.error(f"IMAP error: {e}")
-#         except Exception as e:
-#             logger.error(f"Email fetch error: {e}")
-
-#         return results

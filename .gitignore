@@ -1,9 +1,14 @@
-# Credentials
+# Credentials — NEVER commit these
 .env
+*.env
 
 # Database & logs (auto-generated)
 data/
 logs/
+
+# Generated dashboard images
+*.png
+*.jpg
 
 # Python
 __pycache__/
